@@ -4,6 +4,9 @@ use anchor_lang::solana_program::{program::invoke, system_instruction};
 use ephemeral_vrf_sdk::anchor::vrf;
 use ephemeral_vrf_sdk::instructions::{create_request_randomness_ix, RequestRandomnessParams};
 use ephemeral_vrf_sdk::types::SerializableAccountMeta;
+use ephemeral_rollups_sdk::anchor::{commit, delegate, ephemeral};
+use ephemeral_rollups_sdk::cpi::DelegateConfig;
+use ephemeral_rollups_sdk::ephem::{commit_and_undelegate_accounts};
 
 declare_id!("2zdSF8zfWrpaNEFTnpSPwbHmuGfFpY7jsSoRYeKeDetf");
 
@@ -203,7 +206,7 @@ pub mod moonbets {
             stats.last_reset = now;
         }
         require!(
-            stats.withdrawn_today + amount <= ctx.accounts.platform_stats.daily_withdraw_limit,
+            stats.withdrawn_today + amount <= stats.daily_withdraw_limit,
             ErrorCode::DailyLimitReached
         );
 
@@ -298,7 +301,7 @@ pub mod moonbets {
     ) -> Result<()> {
         let stats = &mut ctx.accounts.platform_stats;
          let is_primary_admin =
-            ctx.accounts.admin.key() == ctx.accounts.platform_stats.primary_admin;
+            ctx.accounts.admin.key() == stats.primary_admin;
 
         // If not primary admin, need to check if they're in admin list
         if !is_primary_admin {
@@ -324,6 +327,28 @@ pub mod moonbets {
 
         Ok(())
     }
+
+    // Delegate the player account to use the VRF in the ephemeral rollups
+    pub fn delegate(ctx: Context<DelegateInput>) -> Result<()> {
+        ctx.accounts.delegate_player(
+            &ctx.accounts.user,
+            &[PLAYER, &ctx.accounts.user.key().to_bytes().as_slice()],
+            DelegateConfig::default(),
+        )?;
+        Ok(())
+    }
+
+    // Undelegate the player account
+    pub fn undelegate(ctx: Context<Undelegate>) -> Result<()> {
+        commit_and_undelegate_accounts(
+            &ctx.accounts.payer,
+            vec![&ctx.accounts.user.to_account_info()],
+            &ctx.accounts.magic_context,
+            &ctx.accounts.magic_program,
+        )?;
+        Ok(())
+    }
+
 
 }
 
@@ -466,6 +491,7 @@ pub struct RemoveAdmin<'info> {
     pub admin: Account<'info, Admin>,
 }
 
+
 #[vrf]
 #[derive(Accounts)]
 pub struct Play<'info> {
@@ -495,15 +521,6 @@ pub struct Play<'info> {
     /// CHECK:
     #[account(mut)]
     pub oracle_queue: AccountInfo<'info>,
-    /// CHECK:
-    #[account(seeds = [ephemeral_vrf_sdk::consts::IDENTITY], bump)]
-    pub program_identity: AccountInfo<'info>,
-    /// CHECK:
-    #[account(address = anchor_lang::solana_program::sysvar::slot_hashes::ID)]
-    pub slot_hashes: AccountInfo<'info>,
-    /// CHECK:
-    #[account(address = ephemeral_vrf_sdk::consts::VRF_PROGRAM_ID)]
-    pub vrf_program: AccountInfo<'info>,
     pub system_program: Program<'info, System>,
 }
 
@@ -589,6 +606,7 @@ pub struct AdminDeposit<'info> {
 
 #[derive(Accounts)]
 pub struct UpdatePlatformLimit<'info> {
+    pub admin: Signer<'info>,
     #[account(
         mut,
         seeds = [STATS_SEED],
@@ -597,6 +615,25 @@ pub struct UpdatePlatformLimit<'info> {
     pub platform_stats: Account<'info, PlatformStats>,
     // Optional because primary admin doesn't need it
     pub admin_account: Option<Account<'info, Admin>>,
+}
+
+#[delegate]
+#[derive(Accounts)]
+pub struct DelegateInput<'info> {
+    #[account(mut)]
+    pub user: Signer<'info>,
+    /// CHECK The pda to delegate
+    #[account(mut, del, seeds = [PLAYER, user.key().to_bytes().as_slice()], bump)]
+    pub player: Account<'info, Player>,
+}
+
+#[commit]
+#[derive(Accounts)]
+pub struct Undelegate<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    #[account(mut)]
+    pub user: Account<'info, Player>,
 }
 
 // Events
