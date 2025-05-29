@@ -1,0 +1,309 @@
+// programs/aibet/src/lib.rs
+use anchor_lang::prelude::*;
+use anchor_lang::solana_program::{program::invoke, system_instruction};
+use ephemeral_vrf_sdk::anchor::vrf;
+use ephemeral_vrf_sdk::instructions::{create_request_randomness_ix, RequestRandomnessParams};
+use ephemeral_vrf_sdk::types::SerializableAccountMeta;
+
+declare_id!("75fuoHrdGCZwtX5GFkKvd6gZf6mFqyEQ2CknVUN1ak1W");
+
+pub const PLAYER: &[u8] = b"playerd";
+pub const MAX_BET_LAMPORTS: u64 = 5_000_000_000;
+pub const DAILY_WITHDRAW_LIMIT: u64 = 15_000_000_000;
+
+#[program]
+pub mod moonbets {
+    use super::*;
+
+    pub fn initialize_platform(ctx: Context<InitializePlatform>) -> Result<()> {
+        let stats = &mut ctx.accounts.platform_stats;
+        stats.is_initialized = true;
+        stats.last_reset = Clock::get()?.unix_timestamp;
+        stats.withdrawn_today = 0;
+        stats.admin = ctx.accounts.admin.key();
+        Ok(())
+    }
+
+    pub fn play(
+        ctx: Context<Play>,
+        user_choice: u8,
+        bet_amount: u64,
+        client_seed: u8,
+    ) -> Result<()> {
+        require!(
+            user_choice >= 1 && user_choice <= 6,
+            ErrorCode::InvalidChoice
+        );
+        require!(bet_amount <= MAX_BET_LAMPORTS, ErrorCode::ExceedsMaxBet);
+
+        let player = &mut ctx.accounts.player;
+
+        // Initialize player data if needed (e.g., first-time creation)
+        if player.total_games == 0 && player.wins == 0 && player.losses == 0 {
+            player.last_result = 0;
+            player.wins = 0;
+            player.losses = 0;
+            player.total_games = 0;
+            player.current_bet = 0;
+            player.pending_withdrawal = 0;
+            player.last_bet_amount = 0;
+        }
+
+        player.current_bet = user_choice;
+        player.last_bet_amount = bet_amount;
+
+        // Transfer bet amount from player to vault
+        invoke(
+            &system_instruction::transfer(
+                &ctx.accounts.payer.key(),
+                &ctx.accounts.platform_vault.key(),
+                bet_amount,
+            ),
+            &[
+                ctx.accounts.payer.to_account_info(),
+                ctx.accounts.platform_vault.to_account_info(),
+            ],
+        )?;
+
+        // Request randomness
+        let ix = create_request_randomness_ix(RequestRandomnessParams {
+            payer: ctx.accounts.payer.key(),
+            oracle_queue: ctx.accounts.oracle_queue.key(),
+            callback_program_id: ID,
+            callback_discriminator: instruction::CallbackRollDice::DISCRIMINATOR.to_vec(),
+            caller_seed: [client_seed; 32],
+            accounts_metas: Some(vec![
+                // Include player account
+                SerializableAccountMeta {
+                    pubkey: ctx.accounts.player.key(),
+                    is_signer: false,
+                    is_writable: true,
+                },
+                // Include platform_stats account
+                SerializableAccountMeta {
+                    pubkey: ctx.accounts.platform_stats.key(),
+                    is_signer: false,
+                    is_writable: true,
+                },
+            ]),
+            ..Default::default()
+        });
+
+        ctx.accounts
+            .invoke_signed_vrf(&ctx.accounts.payer.to_account_info(), &ix)?;
+        Ok(())
+    }
+
+    pub fn callback_roll_dice(
+        ctx: Context<CallbackRollDiceCtx>,
+        randomness: [u8; 32],
+    ) -> Result<()> {
+        let player = &mut ctx.accounts.player;
+        let stats = &mut ctx.accounts.platform_stats;
+
+        let rnd_u8 = ephemeral_vrf_sdk::rnd::random_u8_with_range(&randomness, 1, 6);
+        let user_choice = player.current_bet;
+        let player_won = user_choice == rnd_u8;
+
+        player.last_result = rnd_u8;
+        player.total_games += 1;
+
+        let payout = player.last_bet_amount * 2;
+
+        if player_won {
+            let now = Clock::get()?.unix_timestamp;
+            if now - stats.last_reset > 86400 {
+                stats.withdrawn_today = 0;
+                stats.last_reset = now;
+            }
+            require!(
+                stats.withdrawn_today + payout <= DAILY_WITHDRAW_LIMIT,
+                ErrorCode::DailyLimitReached
+            );
+
+            player.wins += 1;
+            player.pending_withdrawal += payout;
+            stats.withdrawn_today += payout;
+        } else {
+            player.losses += 1;
+        }
+
+        player.current_bet = 0;
+        player.last_bet_amount = 0;
+
+        emit!(DiceRolled {
+            player: player.key(),
+            result: rnd_u8,
+            won: player_won,
+            payout: if player_won { payout } else { 0 },
+        });
+
+        Ok(())
+    }
+
+    pub fn withdraw(ctx: Context<Withdraw>) -> Result<()> {
+        let amount = ctx.accounts.player.pending_withdrawal;
+        require!(amount > 0, ErrorCode::NothingToWithdraw);
+
+        **ctx.accounts.platform_vault.try_borrow_mut_lamports()? -= amount;
+        **ctx.accounts.payer.try_borrow_mut_lamports()? += amount;
+
+        ctx.accounts.player.pending_withdrawal = 0;
+        Ok(())
+    }
+
+    pub fn admin_withdraw(ctx: Context<AdminWithdraw>, amount: u64) -> Result<()> {
+        require!(
+            ctx.accounts.admin.key() == ctx.accounts.platform_stats.admin,
+            ErrorCode::Unauthorized
+        );
+
+        **ctx.accounts.platform_vault.try_borrow_mut_lamports()? -= amount;
+        **ctx.accounts.admin.try_borrow_mut_lamports()? += amount;
+        Ok(())
+    }
+
+    pub fn admin_deposit(ctx: Context<AdminDeposit>, amount: u64) -> Result<()> {
+        invoke(
+            &system_instruction::transfer(
+                &ctx.accounts.admin.key(),
+                &ctx.accounts.platform_vault.key(),
+                amount,
+            ),
+            &[
+                ctx.accounts.admin.to_account_info(),
+                ctx.accounts.platform_vault.to_account_info(),
+            ],
+        )?;
+        Ok(())
+    }
+}
+
+#[derive(Accounts)]
+pub struct InitializePlatform<'info> {
+    #[account(mut)]
+    pub admin: Signer<'info>,
+    #[account(init, payer = admin, space = 8 + 57)]
+    pub platform_stats: Account<'info, PlatformStats>,
+    pub system_program: Program<'info, System>,
+}
+
+#[vrf]
+#[derive(Accounts)]
+pub struct Play<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    #[account(
+        init_if_needed,
+        payer = payer,
+        space = 8 + 40,
+        seeds = [PLAYER, payer.key().as_ref()],
+        bump
+    )]
+    pub player: Account<'info, Player>,
+
+    /// CHECK:
+    #[account(mut)]
+    pub platform_vault: AccountInfo<'info>,
+    /// CHECK:
+    #[account(mut)]
+    pub platform_stats: Account<'info, PlatformStats>,
+    /// CHECK:
+    #[account(mut)]
+    pub oracle_queue: AccountInfo<'info>,
+    /// CHECK:
+    #[account(seeds = [ephemeral_vrf_sdk::consts::IDENTITY], bump)]
+    pub program_identity: AccountInfo<'info>,
+    /// CHECK:
+    #[account(address = anchor_lang::solana_program::sysvar::slot_hashes::ID)]
+    pub slot_hashes: AccountInfo<'info>,
+    /// CHECK:
+    #[account(address = ephemeral_vrf_sdk::consts::VRF_PROGRAM_ID)]
+    pub vrf_program: AccountInfo<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct CallbackRollDiceCtx<'info> {
+    #[account(address = ephemeral_vrf_sdk::consts::VRF_PROGRAM_IDENTITY)]
+    pub vrf_program_identity: Signer<'info>,
+    #[account(mut)]
+    pub player: Account<'info, Player>,
+    #[account(mut)]
+    pub platform_stats: Account<'info, PlatformStats>,
+}
+
+#[derive(Accounts)]
+pub struct Withdraw<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    #[account(mut, seeds = [PLAYER, payer.key().as_ref()], bump)]
+    pub player: Account<'info, Player>,
+    /// CHECK:
+    #[account(mut)]
+    pub platform_vault: AccountInfo<'info>,
+}
+
+#[derive(Accounts)]
+pub struct AdminWithdraw<'info> {
+    #[account(mut)]
+    pub admin: Signer<'info>,
+    /// CHECK:
+    #[account(mut)]
+    pub platform_vault: AccountInfo<'info>,
+    #[account(mut)]
+    pub platform_stats: Account<'info, PlatformStats>,
+}
+
+#[derive(Accounts)]
+pub struct AdminDeposit<'info> {
+    #[account(mut)]
+    pub admin: Signer<'info>,
+    /// CHECK:
+    #[account(mut)]
+    pub platform_vault: AccountInfo<'info>,
+}
+
+#[account]
+pub struct Player {
+    pub last_result: u8,
+    pub current_bet: u8,
+    pub last_bet_amount: u64,
+    pub pending_withdrawal: u64,
+    pub wins: u16,
+    pub losses: u16,
+    pub total_games: u16,
+}
+
+#[account]
+pub struct PlatformStats {
+    pub is_initialized: bool,
+    pub last_reset: i64,
+    pub withdrawn_today: u64,
+    pub admin: Pubkey,
+}
+
+#[event]
+pub struct DiceRolled {
+    pub player: Pubkey,
+    pub result: u8,
+    pub won: bool,
+    pub payout: u64,
+}
+
+#[error_code]
+pub enum ErrorCode {
+    #[msg("Choice must be between 1 and 6")]
+    InvalidChoice,
+    #[msg("No bet placed yet")]
+    NoBetPlaced,
+    #[msg("Bet exceeds max allowed")]
+    ExceedsMaxBet,
+    #[msg("Nothing to withdraw")]
+    NothingToWithdraw,
+    #[msg("Platform daily payout limit reached")]
+    DailyLimitReached,
+    #[msg("Unauthorized")]
+    Unauthorized,
+}
